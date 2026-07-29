@@ -26,7 +26,7 @@ Set these as Environment Variables in the Render dashboard (not in code):
 import os
 import threading
 import time
-from flask import Flask
+from flask import Flask, request
 
 import forex_signal_bot as bot  # reuses everything from the existing script
 
@@ -40,11 +40,26 @@ def watch_loop():
     pairs = [p.strip() for p in pairs if p.strip()]
     interval = int(os.environ.get("CHECK_EVERY_SECONDS", bot.CHECK_EVERY_SECONDS))
 
+    # Tracks the last (bar_time, signal) we already alerted on, per pair,
+    # so a signal that's still active on the same candle doesn't get
+    # re-sent every 15 minutes until the candle closes.
+    last_alerted = {}
+
     while True:
         for pair in pairs:
             try:
-                signal = bot.check_live(pair, notify=True)
+                df = bot.fetch_ohlc(pair, outputsize=300)
+                df = bot.add_indicators(df)
+                last_row = df.iloc[-1]
+                signal = bot.generate_signal(last_row)
+                bar_time = str(last_row["datetime"])
+
                 _status["last_signals"][pair] = signal or "none"
+
+                if signal and last_alerted.get(pair) != (bar_time, signal):
+                    bot.check_live(pair, notify=True)  # sends the Telegram message
+                    last_alerted[pair] = (bar_time, signal)
+
             except Exception as e:
                 print(f"Error checking {pair}: {e}")
                 _status["last_signals"][pair] = f"error: {e}"
@@ -62,7 +77,24 @@ def health():
     }
 
 
+@app.route("/backtest")
+def run_backtest():
+    # Visit e.g. /backtest?pair=EUR/USD&bars=1500 in your browser.
+    # Kept smaller than the CLI default (1500 vs 5000 bars) so it finishes
+    # comfortably inside Render's free-tier request timeout.
+    pair = request.args.get("pair", "EUR/USD")
+    bars = int(request.args.get("bars", 1500))
+    try:
+        df = bot.fetch_ohlc(pair, outputsize=bars)
+        result = bot.backtest(df, pair)
+        result.pop("trade_log", None)  # keep the response small/readable
+        return result
+    except Exception as e:
+        return {"error": str(e)}, 500
+
+
 if __name__ == "__main__":
     threading.Thread(target=watch_loop, daemon=True).start()
     port = int(os.environ.get("PORT", 10000))  # Render sets PORT automatically
     app.run(host="0.0.0.0", port=port)
+    
