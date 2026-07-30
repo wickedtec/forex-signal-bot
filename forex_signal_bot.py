@@ -473,4 +473,101 @@ def summarize(trades: list, pair: str, use_atr: bool = False, use_smc: bool = Fa
 # ---------------------------------------------------------------------------
 def send_telegram(message: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[Telegram not configur
+        print("[Telegram not configured -- skipping push, see setup notes]")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message}, timeout=10)
+    except Exception as e:
+        print(f"Telegram send failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# LIVE CHECK
+# ---------------------------------------------------------------------------
+def check_live(pair: str, notify: bool = False, use_atr: bool = None, use_volatility_filter: bool = None,
+                use_smc: bool = None, min_votes: int = None):
+    if use_atr is None:
+        use_atr = USE_ATR_TARGETS
+    if use_volatility_filter is None:
+        use_volatility_filter = USE_ATR_TARGETS
+    if use_smc is None:
+        use_smc = USE_SMC_FILTER
+    if min_votes is None:
+        min_votes = MIN_CONFLUENCE_VOTES
+
+    df = fetch_ohlc(pair, outputsize=300)  # only need enough bars to warm up indicators
+    df = add_indicators(df)
+    if use_smc:
+        df = add_smc_indicators(df)
+    last = df.iloc[-1]
+    signal = generate_signal(last, use_volatility_filter=use_volatility_filter, use_smc=use_smc, min_votes=min_votes)
+    pip = pip_size(pair)
+
+    ts = last["datetime"]
+    price = last["close"]
+
+    if signal:
+        if use_atr and not pd.isna(last["atr14"]) and last["atr14"] > 0:
+            tp_dist = ATR_TP_MULT * last["atr14"]
+            sl_dist = ATR_SL_MULT * last["atr14"]
+        else:
+            tp_dist = TP_PIPS * pip
+            sl_dist = SL_PIPS * pip
+
+        tp_pips = round(tp_dist / pip, 1)
+        sl_pips = round(sl_dist / pip, 1)
+        tp = price + tp_dist if signal == "BUY" else price - tp_dist
+        sl = price - sl_dist if signal == "BUY" else price + sl_dist
+        msg = (f"[{pair}] {signal} SIGNAL @ {price:.5f} ({ts})\n"
+               f"TP: {tp:.5f} ({tp_pips} pips) | SL: {sl:.5f} ({sl_pips} pips)")
+    else:
+        msg = f"[{pair}] No signal @ {price:.5f} ({ts}) -- confluence conditions not met."
+
+    print(msg)
+    if notify and signal:
+        send_telegram(msg)
+    return signal
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def main():
+    if len(sys.argv) < 3:
+        print(__doc__)
+        return
+
+    mode = sys.argv[1]
+    pairs = sys.argv[2:]
+
+    if mode == "backtest":
+        for pair in pairs:
+            print(f"\n=== Backtesting {pair} ({INTERVAL}, ATR={USE_ATR_TARGETS}, SMC={USE_SMC_FILTER}, "
+                  f"min_votes={MIN_CONFLUENCE_VOTES}, last {OUTPUT_SIZE} bars) ===")
+            df = fetch_ohlc(pair)
+            result = backtest(df, pair)
+            for k, v in result.items():
+                if k != "trade_log":
+                    print(f"  {k}: {v}")
+
+    elif mode == "live":
+        for pair in pairs:
+            check_live(pair, notify=False)
+
+    elif mode == "watch":
+        print(f"Watching {pairs} every {CHECK_EVERY_SECONDS//60} min. Ctrl+C to stop.")
+        while True:
+            for pair in pairs:
+                try:
+                    check_live(pair, notify=True)
+                except Exception as e:
+                    print(f"Error checking {pair}: {e}")
+            time.sleep(CHECK_EVERY_SECONDS)
+
+    else:
+        print(__doc__)
+
+
+if __name__ == "__main__":
+    main()
