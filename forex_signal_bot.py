@@ -45,9 +45,39 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")       # your chat id
 
 TP_PIPS = 100
 SL_PIPS = 30
-INTERVAL = "1h"          # timeframe: 1min,5min,15min,1h,4h,1day
+INTERVAL = "15min"      # timeframe: 1min,5min,15min,1h,4h,1day
 OUTPUT_SIZE = 5000       # how many bars to pull (max ~5000 on free tier per call)
-CHECK_EVERY_SECONDS = 900  # 15 min, used by "watch" mode
+CHECK_EVERY_SECONDS = 300  # 5 min, used by "watch" mode -- tighter since 15min candles close faster
+
+# ATR-adaptive targets: instead of a fixed pip TP/SL, scale the target to
+# each pair's actual recent volatility (ATR). This matters a lot on faster
+# timeframes like 15min, where a fixed 100-pip target is far too wide for
+# the size of moves that timeframe normally produces -- trades either
+# never resolve or take absurdly long. Fixed pips still make sense on
+# slower timeframes (1h/4h/1day on majors) where 100 pips is a "normal"
+# sized move for the horizon.
+USE_ATR_TARGETS = True    # on by default now that 15min is the default timeframe
+ATR_TP_MULT = 3.0         # TP = entry +/- ATR_TP_MULT * ATR   (keeps ~3.3:1 R:R like 100/30)
+ATR_SL_MULT = 1.0         # SL = entry +/- ATR_SL_MULT * ATR
+
+# Minimum-volatility filter: on fast timeframes (15min especially), a lot
+# of candles happen during dead/quiet sessions where confluence conditions
+# can technically align but there's no real momentum behind the move.
+# Requiring current ATR to be at least this fraction of its own 50-bar
+# average filters those out. Set to 0 to disable.
+MIN_VOLATILITY_RATIO = 0.6
+
+# Smart Money Concepts (SMC) filter: this is now the PRIMARY signal driver.
+# A trade requires market structure + an active order block/FVG to align --
+# that's the anchor. The 4 indicator votes (trend/momentum/RSI/BB) become a
+# lighter secondary confirmation layer on top, only needing MIN_CONFLUENCE_VOTES
+# out of 4 to agree rather than all 4. This trades some win-rate for a lot
+# more signal frequency -- expect noticeably more trades, expect a lower
+# per-trade win rate too. Backtest before trusting it live.
+USE_SMC_FILTER = True
+MIN_CONFLUENCE_VOTES = 2  # out of 4 indicator votes required, on top of SMC alignment
+SMC_SWING_LOOKBACK = 2     # bars on each side to confirm a fractal swing point
+SMC_ZONE_VALID_BARS = 50   # how many bars an order block / FVG stays "active" before going stale
 
 # ---------------------------------------------------------------------------
 # DATA FETCHING
@@ -132,6 +162,123 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["macd"], df["macd_signal"], df["macd_hist"] = macd(df["close"])
     df["bb_upper"], df["bb_mid"], df["bb_lower"] = bollinger(df["close"])
     df["atr14"] = atr(df, 14)
+    df["atr_avg50"] = df["atr14"].rolling(50).mean()
+    return df
+
+
+# ---------------------------------------------------------------------------
+# SMART MONEY CONCEPTS (SMC)
+# Market structure (break of structure), order blocks, and fair value gaps.
+# Kept simple/readable rather than matching every edge case a dedicated SMC
+# indicator would -- good enough to meaningfully filter signals by context.
+# ---------------------------------------------------------------------------
+def find_swings(df: pd.DataFrame, lookback: int = SMC_SWING_LOOKBACK):
+    """Fractal swing highs/lows: a bar is a swing point if it's the highest
+    high (or lowest low) among `lookback` bars on each side of it."""
+    n = len(df)
+    swing_high = [False] * n
+    swing_low = [False] * n
+    highs = df["high"].values
+    lows = df["low"].values
+
+    for i in range(lookback, n - lookback):
+        window_h = highs[i - lookback: i + lookback + 1]
+        window_l = lows[i - lookback: i + lookback + 1]
+        if highs[i] == window_h.max():
+            swing_high[i] = True
+        if lows[i] == window_l.min():
+            swing_low[i] = True
+
+    return swing_high, swing_low
+
+
+def add_smc_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adds, per bar:
+      structure_trend            'bullish' / 'bearish' / None, from break of structure (BOS)
+      bull_ob_low / bull_ob_high  most recent active bullish order block zone
+      bear_ob_low / bear_ob_high  most recent active bearish order block zone
+      bull_fvg_low / bull_fvg_high most recent unfilled bullish fair value gap
+      bear_fvg_low / bear_fvg_high most recent unfilled bearish fair value gap
+    """
+    df = df.copy()
+    n = len(df)
+    swing_high, swing_low = find_swings(df)
+
+    opens, closes = df["open"].values, df["close"].values
+    highs, lows = df["high"].values, df["low"].values
+
+    structure_trend = [None] * n
+    bull_ob_low, bull_ob_high = [np.nan] * n, [np.nan] * n
+    bear_ob_low, bear_ob_high = [np.nan] * n, [np.nan] * n
+
+    last_swing_high, last_swing_low = None, None
+    trend = None
+    active_bull_ob, active_bear_ob = None, None  # (low, high, created_at_index)
+
+    for i in range(n):
+        if swing_high[i]:
+            last_swing_high = highs[i]
+        if swing_low[i]:
+            last_swing_low = lows[i]
+
+        # Break of structure up -> bullish. Order block = the last down-close
+        # candle before the impulsive move that broke structure.
+        if last_swing_high is not None and closes[i] > last_swing_high and trend != "bullish":
+            trend = "bullish"
+            for k in range(i - 1, max(i - 30, 0), -1):
+                if closes[k] < opens[k]:
+                    active_bull_ob = (lows[k], highs[k], i)
+                    break
+
+        # Break of structure down -> bearish. Order block = last up-close candle.
+        if last_swing_low is not None and closes[i] < last_swing_low and trend != "bearish":
+            trend = "bearish"
+            for k in range(i - 1, max(i - 30, 0), -1):
+                if closes[k] > opens[k]:
+                    active_bear_ob = (lows[k], highs[k], i)
+                    break
+
+        # Expire order blocks: too old, or price has already closed through them
+        if active_bull_ob and (i - active_bull_ob[2] > SMC_ZONE_VALID_BARS or lows[i] < active_bull_ob[0]):
+            active_bull_ob = None
+        if active_bear_ob and (i - active_bear_ob[2] > SMC_ZONE_VALID_BARS or highs[i] > active_bear_ob[1]):
+            active_bear_ob = None
+
+        structure_trend[i] = trend
+        if active_bull_ob:
+            bull_ob_low[i], bull_ob_high[i] = active_bull_ob[0], active_bull_ob[1]
+        if active_bear_ob:
+            bear_ob_low[i], bear_ob_high[i] = active_bear_ob[0], active_bear_ob[1]
+
+    df["structure_trend"] = structure_trend
+    df["bull_ob_low"], df["bull_ob_high"] = bull_ob_low, bull_ob_high
+    df["bear_ob_low"], df["bear_ob_high"] = bear_ob_low, bear_ob_high
+
+    # Fair Value Gaps: 3-candle imbalance (a gap between candle[i-2] and candle[i])
+    bull_fvg_low, bull_fvg_high = [np.nan] * n, [np.nan] * n
+    bear_fvg_low, bear_fvg_high = [np.nan] * n, [np.nan] * n
+    active_bull_fvg, active_bear_fvg = None, None
+
+    for i in range(2, n):
+        if highs[i - 2] < lows[i]:            # gap up
+            active_bull_fvg = (highs[i - 2], lows[i], i)
+        if lows[i - 2] > highs[i]:             # gap down
+            active_bear_fvg = (highs[i], lows[i - 2], i)
+
+        if active_bull_fvg and (i - active_bull_fvg[2] > SMC_ZONE_VALID_BARS or lows[i] < active_bull_fvg[0]):
+            active_bull_fvg = None
+        if active_bear_fvg and (i - active_bear_fvg[2] > SMC_ZONE_VALID_BARS or highs[i] > active_bear_fvg[1]):
+            active_bear_fvg = None
+
+        if active_bull_fvg:
+            bull_fvg_low[i], bull_fvg_high[i] = active_bull_fvg[0], active_bull_fvg[1]
+        if active_bear_fvg:
+            bear_fvg_low[i], bear_fvg_high[i] = active_bear_fvg[0], active_bear_fvg[1]
+
+    df["bull_fvg_low"], df["bull_fvg_high"] = bull_fvg_low, bull_fvg_high
+    df["bear_fvg_low"], df["bear_fvg_high"] = bear_fvg_low, bear_fvg_high
+
     return df
 
 
@@ -140,11 +287,38 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # Signal fires only when trend + momentum + volatility-position agree.
 # This is deliberately conservative -- fewer signals, higher quality.
 # ---------------------------------------------------------------------------
-def generate_signal(row) -> str:
+def generate_signal(row, use_volatility_filter: bool = False, use_smc: bool = None, min_votes: int = None) -> str:
     """Return 'BUY', 'SELL', or None for a single row of indicator data."""
+    if use_smc is None:
+        use_smc = USE_SMC_FILTER
+    if min_votes is None:
+        min_votes = MIN_CONFLUENCE_VOTES
+
     if pd.isna(row["ema200"]) or pd.isna(row["bb_lower"]):
         return None
 
+    if use_volatility_filter and MIN_VOLATILITY_RATIO > 0:
+        if pd.isna(row.get("atr_avg50")) or row["atr_avg50"] == 0:
+            return None
+        if row["atr14"] < MIN_VOLATILITY_RATIO * row["atr_avg50"]:
+            return None  # market too quiet right now -- skip, likely noise
+
+    # --- SMC gate (primary): no trade at all unless structure + zone align ---
+    smc_buy_ok, smc_sell_ok = True, True
+    if use_smc:
+        price = row["close"]
+        in_bull_ob = not pd.isna(row.get("bull_ob_low")) and row["bull_ob_low"] <= price <= row["bull_ob_high"]
+        in_bull_fvg = not pd.isna(row.get("bull_fvg_low")) and row["bull_fvg_low"] <= price <= row["bull_fvg_high"]
+        in_bear_ob = not pd.isna(row.get("bear_ob_low")) and row["bear_ob_low"] <= price <= row["bear_ob_high"]
+        in_bear_fvg = not pd.isna(row.get("bear_fvg_low")) and row["bear_fvg_low"] <= price <= row["bear_fvg_high"]
+
+        smc_buy_ok = row.get("structure_trend") == "bullish" and (in_bull_ob or in_bull_fvg)
+        smc_sell_ok = row.get("structure_trend") == "bearish" and (in_bear_ob or in_bear_fvg)
+
+        if not smc_buy_ok and not smc_sell_ok:
+            return None  # no institutional zone lined up -- skip regardless of indicators
+
+    # --- indicator votes (secondary confirmation) ---
     trend_up = row["ema50"] > row["ema200"]
     trend_down = row["ema50"] < row["ema200"]
 
@@ -160,9 +334,9 @@ def generate_signal(row) -> str:
     buy_votes = sum([trend_up, momentum_up, rsi_ok_buy, near_lower_band])
     sell_votes = sum([trend_down, momentum_down, rsi_ok_sell, near_upper_band])
 
-    if buy_votes == 4:
+    if smc_buy_ok and buy_votes >= min_votes:
         return "BUY"
-    if sell_votes == 4:
+    if smc_sell_ok and sell_votes >= min_votes:
         return "SELL"
     return None
 
@@ -172,11 +346,23 @@ def generate_signal(row) -> str:
 # Walk forward bar by bar. Once a signal fires, watch subsequent bars until
 # TP or SL is hit (whichever comes first, checked with highs/lows).
 # ---------------------------------------------------------------------------
-def backtest(df: pd.DataFrame, pair: str) -> dict:
+def backtest(df: pd.DataFrame, pair: str, use_atr: bool = None, use_volatility_filter: bool = None,
+             use_smc: bool = None, min_votes: int = None) -> dict:
+    # Defaults follow the module-level config, but can be overridden per call
+    # (used by the /backtest?atr=true&smc=true&min_votes=2 web endpoint).
+    if use_atr is None:
+        use_atr = USE_ATR_TARGETS
+    if use_volatility_filter is None:
+        use_volatility_filter = USE_ATR_TARGETS  # ATR mode implies the filter too, by default
+    if use_smc is None:
+        use_smc = USE_SMC_FILTER
+    if min_votes is None:
+        min_votes = MIN_CONFLUENCE_VOTES
+
     df = add_indicators(df)
+    if use_smc:
+        df = add_smc_indicators(df)
     pip = pip_size(pair)
-    tp_dist = TP_PIPS * pip
-    sl_dist = SL_PIPS * pip
 
     trades = []
     i = 0
@@ -184,10 +370,24 @@ def backtest(df: pd.DataFrame, pair: str) -> dict:
 
     while i < n - 1:
         row = df.iloc[i]
-        signal = generate_signal(row)
+        signal = generate_signal(row, use_volatility_filter=use_volatility_filter, use_smc=use_smc, min_votes=min_votes)
 
         if signal:
             entry = df.iloc[i]["close"]
+
+            if use_atr:
+                if pd.isna(row["atr14"]) or row["atr14"] == 0:
+                    i += 1
+                    continue
+                tp_dist = ATR_TP_MULT * row["atr14"]
+                sl_dist = ATR_SL_MULT * row["atr14"]
+            else:
+                tp_dist = TP_PIPS * pip
+                sl_dist = SL_PIPS * pip
+
+            tp_pips = tp_dist / pip
+            sl_pips = sl_dist / pip
+
             if signal == "BUY":
                 tp_price, sl_price = entry + tp_dist, entry - sl_dist
             else:
@@ -223,35 +423,46 @@ def backtest(df: pd.DataFrame, pair: str) -> dict:
                     "direction": signal,
                     "entry": entry,
                     "outcome": outcome,
-                    "pips": TP_PIPS if outcome == "TP" else -SL_PIPS,
+                    "pips": round(tp_pips if outcome == "TP" else -sl_pips, 1),
+                    "tp_pips_target": round(tp_pips, 1),
+                    "sl_pips_target": round(sl_pips, 1),
                 })
                 i = exit_i + 1
                 continue
         i += 1
 
-    return summarize(trades, pair)
+    return summarize(trades, pair, use_atr, use_smc)
 
 
-def summarize(trades: list, pair: str) -> dict:
+def summarize(trades: list, pair: str, use_atr: bool = False, use_smc: bool = False) -> dict:
     n = len(trades)
     if n == 0:
-        return {"pair": pair, "trades": 0, "message": "No signals generated in this data window."}
+        return {"pair": pair, "trades": 0, "smc_filter": use_smc,
+                "message": "No signals generated in this data window."}
 
     wins = sum(1 for t in trades if t["outcome"] == "TP")
     losses = n - wins
     win_rate = wins / n * 100
     total_pips = sum(t["pips"] for t in trades)
     expectancy = total_pips / n
-    breakeven_wr = SL_PIPS / (TP_PIPS + SL_PIPS) * 100
+
+    # Breakeven win rate needed: with fixed pips this is one number; with
+    # ATR-adaptive targets it varies per trade, so average the per-trade
+    # reward:risk ratios and derive breakeven from that.
+    avg_rr = sum(t["tp_pips_target"] / t["sl_pips_target"] for t in trades) / n
+    breakeven_wr = 1 / (1 + avg_rr) * 100
 
     return {
         "pair": pair,
+        "target_mode": "ATR-adaptive" if use_atr else "fixed-pips",
+        "smc_filter": use_smc,
         "trades": n,
         "wins": wins,
         "losses": losses,
         "win_rate_pct": round(win_rate, 2),
+        "avg_reward_risk_ratio": round(avg_rr, 2),
         "breakeven_win_rate_needed_pct": round(breakeven_wr, 2),
-        "total_pips": total_pips,
+        "total_pips": round(total_pips, 1),
         "expectancy_pips_per_trade": round(expectancy, 2),
         "trade_log": trades,
     }
@@ -262,79 +473,4 @@ def summarize(trades: list, pair: str) -> dict:
 # ---------------------------------------------------------------------------
 def send_telegram(message: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[Telegram not configured -- skipping push, see setup notes]")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    try:
-        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message}, timeout=10)
-    except Exception as e:
-        print(f"Telegram send failed: {e}")
-
-
-# ---------------------------------------------------------------------------
-# LIVE CHECK
-# ---------------------------------------------------------------------------
-def check_live(pair: str, notify: bool = False):
-    df = fetch_ohlc(pair, outputsize=300)  # only need enough bars to warm up indicators
-    df = add_indicators(df)
-    last = df.iloc[-1]
-    signal = generate_signal(last)
-    pip = pip_size(pair)
-
-    ts = last["datetime"]
-    price = last["close"]
-
-    if signal:
-        tp = price + TP_PIPS * pip if signal == "BUY" else price - TP_PIPS * pip
-        sl = price - SL_PIPS * pip if signal == "BUY" else price + SL_PIPS * pip
-        msg = (f"[{pair}] {signal} SIGNAL @ {price:.5f} ({ts})\n"
-               f"TP: {tp:.5f} ({TP_PIPS} pips) | SL: {sl:.5f} ({SL_PIPS} pips)")
-    else:
-        msg = f"[{pair}] No signal @ {price:.5f} ({ts}) -- confluence conditions not met."
-
-    print(msg)
-    if notify and signal:
-        send_telegram(msg)
-    return signal
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-def main():
-    if len(sys.argv) < 3:
-        print(__doc__)
-        return
-
-    mode = sys.argv[1]
-    pairs = sys.argv[2:]
-
-    if mode == "backtest":
-        for pair in pairs:
-            print(f"\n=== Backtesting {pair} ({INTERVAL}, last {OUTPUT_SIZE} bars) ===")
-            df = fetch_ohlc(pair)
-            result = backtest(df, pair)
-            for k, v in result.items():
-                if k != "trade_log":
-                    print(f"  {k}: {v}")
-
-    elif mode == "live":
-        for pair in pairs:
-            check_live(pair, notify=False)
-
-    elif mode == "watch":
-        print(f"Watching {pairs} every {CHECK_EVERY_SECONDS//60} min. Ctrl+C to stop.")
-        while True:
-            for pair in pairs:
-                try:
-                    check_live(pair, notify=True)
-                except Exception as e:
-                    print(f"Error checking {pair}: {e}")
-            time.sleep(CHECK_EVERY_SECONDS)
-
-    else:
-        print(__doc__)
-
-
-if __name__ == "__main__":
-    main()
+        print("[Telegram not configur
