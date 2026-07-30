@@ -75,9 +75,26 @@ MIN_VOLATILITY_RATIO = 0.6
 # more signal frequency -- expect noticeably more trades, expect a lower
 # per-trade win rate too. Backtest before trusting it live.
 USE_SMC_FILTER = True
-MIN_CONFLUENCE_VOTES = 2  # out of 4 indicator votes required, on top of SMC alignment
+MIN_CONFLUENCE_VOTES = 3  # out of 4 indicator votes required, on top of SMC alignment
 SMC_SWING_LOOKBACK = 2     # bars on each side to confirm a fractal swing point
 SMC_ZONE_VALID_BARS = 50   # how many bars an order block / FVG stays "active" before going stale
+SMC_REQUIRE_REJECTION = True  # require a wick-into-zone + confirming close, not just "price is inside the zone"
+
+# Higher-timeframe bias filter: only take signals that agree with the trend
+# on a slower timeframe. A very common real cause of bad win rates on fast
+# timeframes is taking setups that look fine on M15 but are fighting the H1
+# trend. Off by default cost: fewer signals. Benefit: each one has a bigger
+# structural tailwind behind it.
+USE_HTF_FILTER = True
+HTF_INTERVAL = "1h"
+
+# Session filter: skip low-liquidity hours (Asian session chop is a common
+# source of fake SMC signals -- thin volume produces structure breaks and
+# "order blocks" that don't hold up once London/NY volume shows up).
+# Hours are UTC. Default window covers London open through NY close.
+USE_SESSION_FILTER = True
+SESSION_START_HOUR = 7   # 07:00 UTC (London open)
+SESSION_END_HOUR = 16    # 16:00 UTC (NY afternoon)
 
 # ---------------------------------------------------------------------------
 # DATA FETCHING
@@ -282,17 +299,47 @@ def add_smc_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def get_htf_trend(pair: str, htf_interval: str = None, bars: int = 300) -> pd.DataFrame:
+    """Fetch a higher timeframe and compute a simple EMA50/EMA200 trend label
+    per bar, for aligning against the faster timeframe used for entries."""
+    if htf_interval is None:
+        htf_interval = HTF_INTERVAL
+    htf_df = fetch_ohlc(pair, interval=htf_interval, outputsize=bars)
+    htf_df["ema50"] = ema(htf_df["close"], 50)
+    htf_df["ema200"] = ema(htf_df["close"], 200)
+    htf_df["htf_trend"] = np.where(
+        htf_df["ema50"] > htf_df["ema200"], "bullish",
+        np.where(htf_df["ema50"] < htf_df["ema200"], "bearish", None)
+    )
+    return htf_df[["datetime", "htf_trend"]]
+
+
+def attach_htf_trend(df: pd.DataFrame, pair: str, htf_interval: str = None) -> pd.DataFrame:
+    """Merge each bar with the most recently CLOSED higher-timeframe trend
+    at that point in time (no lookahead -- uses backward merge_asof)."""
+    htf = get_htf_trend(pair, htf_interval)
+    df = df.copy()
+    df = pd.merge_asof(df.sort_values("datetime"), htf.sort_values("datetime"),
+                        on="datetime", direction="backward")
+    return df
+
+
 # ---------------------------------------------------------------------------
 # CONFLUENCE STRATEGY
 # Signal fires only when trend + momentum + volatility-position agree.
 # This is deliberately conservative -- fewer signals, higher quality.
 # ---------------------------------------------------------------------------
-def generate_signal(row, use_volatility_filter: bool = False, use_smc: bool = None, min_votes: int = None) -> str:
+def generate_signal(row, use_volatility_filter: bool = False, use_smc: bool = None, min_votes: int = None,
+                     use_session_filter: bool = None, use_htf_filter: bool = None) -> str:
     """Return 'BUY', 'SELL', or None for a single row of indicator data."""
     if use_smc is None:
         use_smc = USE_SMC_FILTER
     if min_votes is None:
         min_votes = MIN_CONFLUENCE_VOTES
+    if use_session_filter is None:
+        use_session_filter = USE_SESSION_FILTER
+    if use_htf_filter is None:
+        use_htf_filter = USE_HTF_FILTER
 
     if pd.isna(row["ema200"]) or pd.isna(row["bb_lower"]):
         return None
@@ -303,14 +350,45 @@ def generate_signal(row, use_volatility_filter: bool = False, use_smc: bool = No
         if row["atr14"] < MIN_VOLATILITY_RATIO * row["atr_avg50"]:
             return None  # market too quiet right now -- skip, likely noise
 
+    # --- Session filter: skip thin-liquidity hours ---
+    if use_session_filter:
+        hour = row["datetime"].hour if hasattr(row["datetime"], "hour") else pd.Timestamp(row["datetime"]).hour
+        if not (SESSION_START_HOUR <= hour < SESSION_END_HOUR):
+            return None
+
+    # --- Higher-timeframe bias gate ---
+    htf_buy_ok, htf_sell_ok = True, True
+    if use_htf_filter:
+        htf_trend = row.get("htf_trend")
+        if htf_trend is None or pd.isna(htf_trend):
+            return None  # no HTF data yet (warm-up period) -- skip rather than guess
+        htf_buy_ok = htf_trend == "bullish"
+        htf_sell_ok = htf_trend == "bearish"
+        if not htf_buy_ok and not htf_sell_ok:
+            return None
+
     # --- SMC gate (primary): no trade at all unless structure + zone align ---
     smc_buy_ok, smc_sell_ok = True, True
     if use_smc:
-        price = row["close"]
-        in_bull_ob = not pd.isna(row.get("bull_ob_low")) and row["bull_ob_low"] <= price <= row["bull_ob_high"]
-        in_bull_fvg = not pd.isna(row.get("bull_fvg_low")) and row["bull_fvg_low"] <= price <= row["bull_fvg_high"]
-        in_bear_ob = not pd.isna(row.get("bear_ob_low")) and row["bear_ob_low"] <= price <= row["bear_ob_high"]
-        in_bear_fvg = not pd.isna(row.get("bear_fvg_low")) and row["bear_fvg_low"] <= price <= row["bear_fvg_high"]
+        o, h, l, c = row["open"], row["high"], row["low"], row["close"]
+
+        bull_ob_active = not pd.isna(row.get("bull_ob_low"))
+        bull_fvg_active = not pd.isna(row.get("bull_fvg_low"))
+        bear_ob_active = not pd.isna(row.get("bear_ob_low"))
+        bear_fvg_active = not pd.isna(row.get("bear_fvg_low"))
+
+        if SMC_REQUIRE_REJECTION:
+            # Wick INTO the zone, but close back out with a confirming candle --
+            # this is "mitigation + rejection", not just "price happens to be here".
+            in_bull_ob = bull_ob_active and l <= row["bull_ob_high"] and c >= row["bull_ob_low"] and c > o
+            in_bull_fvg = bull_fvg_active and l <= row["bull_fvg_high"] and c >= row["bull_fvg_low"] and c > o
+            in_bear_ob = bear_ob_active and h >= row["bear_ob_low"] and c <= row["bear_ob_high"] and c < o
+            in_bear_fvg = bear_fvg_active and h >= row["bear_fvg_low"] and c <= row["bear_fvg_high"] and c < o
+        else:
+            in_bull_ob = bull_ob_active and row["bull_ob_low"] <= c <= row["bull_ob_high"]
+            in_bull_fvg = bull_fvg_active and row["bull_fvg_low"] <= c <= row["bull_fvg_high"]
+            in_bear_ob = bear_ob_active and row["bear_ob_low"] <= c <= row["bear_ob_high"]
+            in_bear_fvg = bear_fvg_active and row["bear_fvg_low"] <= c <= row["bear_fvg_high"]
 
         smc_buy_ok = row.get("structure_trend") == "bullish" and (in_bull_ob or in_bull_fvg)
         smc_sell_ok = row.get("structure_trend") == "bearish" and (in_bear_ob or in_bear_fvg)
@@ -334,9 +412,9 @@ def generate_signal(row, use_volatility_filter: bool = False, use_smc: bool = No
     buy_votes = sum([trend_up, momentum_up, rsi_ok_buy, near_lower_band])
     sell_votes = sum([trend_down, momentum_down, rsi_ok_sell, near_upper_band])
 
-    if smc_buy_ok and buy_votes >= min_votes:
+    if smc_buy_ok and htf_buy_ok and buy_votes >= min_votes:
         return "BUY"
-    if smc_sell_ok and sell_votes >= min_votes:
+    if smc_sell_ok and htf_sell_ok and sell_votes >= min_votes:
         return "SELL"
     return None
 
@@ -347,9 +425,9 @@ def generate_signal(row, use_volatility_filter: bool = False, use_smc: bool = No
 # TP or SL is hit (whichever comes first, checked with highs/lows).
 # ---------------------------------------------------------------------------
 def backtest(df: pd.DataFrame, pair: str, use_atr: bool = None, use_volatility_filter: bool = None,
-             use_smc: bool = None, min_votes: int = None) -> dict:
+             use_smc: bool = None, min_votes: int = None, use_htf: bool = None, use_session: bool = None) -> dict:
     # Defaults follow the module-level config, but can be overridden per call
-    # (used by the /backtest?atr=true&smc=true&min_votes=2 web endpoint).
+    # (used by the /backtest?atr=true&smc=true&min_votes=3&htf=true&session=true web endpoint).
     if use_atr is None:
         use_atr = USE_ATR_TARGETS
     if use_volatility_filter is None:
@@ -358,10 +436,16 @@ def backtest(df: pd.DataFrame, pair: str, use_atr: bool = None, use_volatility_f
         use_smc = USE_SMC_FILTER
     if min_votes is None:
         min_votes = MIN_CONFLUENCE_VOTES
+    if use_htf is None:
+        use_htf = USE_HTF_FILTER
+    if use_session is None:
+        use_session = USE_SESSION_FILTER
 
     df = add_indicators(df)
     if use_smc:
         df = add_smc_indicators(df)
+    if use_htf:
+        df = attach_htf_trend(df, pair)
     pip = pip_size(pair)
 
     trades = []
@@ -370,7 +454,8 @@ def backtest(df: pd.DataFrame, pair: str, use_atr: bool = None, use_volatility_f
 
     while i < n - 1:
         row = df.iloc[i]
-        signal = generate_signal(row, use_volatility_filter=use_volatility_filter, use_smc=use_smc, min_votes=min_votes)
+        signal = generate_signal(row, use_volatility_filter=use_volatility_filter, use_smc=use_smc,
+                                  min_votes=min_votes, use_session_filter=use_session, use_htf_filter=use_htf)
 
         if signal:
             entry = df.iloc[i]["close"]
@@ -486,7 +571,7 @@ def send_telegram(message: str):
 # LIVE CHECK
 # ---------------------------------------------------------------------------
 def check_live(pair: str, notify: bool = False, use_atr: bool = None, use_volatility_filter: bool = None,
-                use_smc: bool = None, min_votes: int = None):
+                use_smc: bool = None, min_votes: int = None, use_htf: bool = None, use_session: bool = None):
     if use_atr is None:
         use_atr = USE_ATR_TARGETS
     if use_volatility_filter is None:
@@ -495,13 +580,20 @@ def check_live(pair: str, notify: bool = False, use_atr: bool = None, use_volati
         use_smc = USE_SMC_FILTER
     if min_votes is None:
         min_votes = MIN_CONFLUENCE_VOTES
+    if use_htf is None:
+        use_htf = USE_HTF_FILTER
+    if use_session is None:
+        use_session = USE_SESSION_FILTER
 
     df = fetch_ohlc(pair, outputsize=300)  # only need enough bars to warm up indicators
     df = add_indicators(df)
     if use_smc:
         df = add_smc_indicators(df)
+    if use_htf:
+        df = attach_htf_trend(df, pair)
     last = df.iloc[-1]
-    signal = generate_signal(last, use_volatility_filter=use_volatility_filter, use_smc=use_smc, min_votes=min_votes)
+    signal = generate_signal(last, use_volatility_filter=use_volatility_filter, use_smc=use_smc, min_votes=min_votes,
+                              use_session_filter=use_session, use_htf_filter=use_htf)
     pip = pip_size(pair)
 
     ts = last["datetime"]
